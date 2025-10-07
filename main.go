@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
 	"strings"
 
 	"github.com/google/uuid"
@@ -20,48 +22,115 @@ type Task struct {
 
 var db *sql.DB
 
+// Конфигурация базы данных
+const (
+	dbHost     = "localhost"
+	dbPort     = "5432"
+	dbUser     = "postgres"
+	dbPassword = "123"
+	dbName     = "postgres"
+	sslMode    = "disable"
+)
+
 func main() {
-	// Подключение к бд
-	connStr := "user=postgres dbname=postgres password=123 sslmode=disable"
+	// Подключение к БД
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
+
 	var err error
 	db, err = sql.Open("postgres", connStr)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("Ошибка подключения к БД:", err)
 	}
 	defer db.Close()
 
 	// Проверка подключения
 	err = db.Ping()
 	if err != nil {
-		log.Fatal(err, "нет подключения к бд")
+		log.Fatal("Нет подключения к БД:", err)
 	}
 
-	// Создание таблицы если не существует
-	createTable()
+	// Обработка команд миграции
+	if len(os.Args) > 1 {
+		handleMigrationCommand(os.Args[1])
+		return
+	}
 
+	// Запуск HTTP-сервера
+	startServer()
+}
+
+// Обработка команд миграции
+func handleMigrationCommand(command string) {
+	migrationDir := "./migrations"
+
+	switch command {
+	case "migrate-up":
+		runGooseCommand("up", migrationDir)
+	case "migrate-down":
+		runGooseCommand("down", migrationDir)
+	case "migrate-status":
+		runGooseCommand("status", migrationDir)
+	case "migrate-create":
+		if len(os.Args) < 3 {
+			log.Fatal("Для создания миграции укажите название: go run main.go migrate-create <name>")
+		}
+		createMigration(os.Args[2])
+	default:
+		log.Printf("Неизвестная команда: %s", command)
+		log.Printf("Доступные команды:")
+		log.Printf("  migrate-up     - Применить все миграции")
+		log.Printf("  migrate-down   - Откатить последнюю миграцию")
+		log.Printf("  migrate-status - Показать статус миграций")
+		log.Printf("  migrate-create <name> - Создать новую миграцию")
+	}
+}
+
+// Запуск команд Goose
+func runGooseCommand(command string, migrationDir string) {
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=%s",
+		dbHost, dbPort, dbUser, dbPassword, dbName, sslMode)
+
+	cmd := exec.Command("goose", "-dir", migrationDir, "postgres", connStr, command)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("Выполнение команды: goose %s", command)
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Ошибка выполнения миграции: %v", err)
+	}
+}
+
+// Создание новой миграции
+func createMigration(name string) {
+	cmd := exec.Command("goose", "-dir", "migrations", "create", name, "sql")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("Создание миграции: %s", name)
+	if err := cmd.Run(); err != nil {
+		log.Fatalf("Ошибка создания миграции: %v", err)
+	}
+}
+
+// Запуск HTTP-сервера
+func startServer() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/tasks", tasksHandler)
 	mux.HandleFunc("/tasks/", taskByIDHandler)
 
 	fmt.Println("Сервер запущен на порту 8080")
+	fmt.Println("Доступные endpoints:")
+	fmt.Println("  GET    /tasks     - Получить все задачи")
+	fmt.Println("  POST   /tasks     - Создать новую задачу")
+	fmt.Println("  GET    /tasks/{id} - Получить задачу по ID")
+	fmt.Println("  PUT    /tasks/{id} - Обновить задачу")
+	fmt.Println("  DELETE /tasks/{id} - Удалить задачу")
+
 	log.Fatal(http.ListenAndServe(":8080", mux))
 }
 
-func createTable() {
-	query := `
-		CREATE TABLE IF NOT EXISTS tasks (
-			id UUID PRIMARY KEY,
-			title TEXT NOT NULL,
-			done BOOLEAN DEFAULT FALSE
-		)
-	`
-	_, err := db.Exec(query)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-// Обработчик для задач без id
+// Обработчик для /tasks
 func tasksHandler(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -75,7 +144,6 @@ func tasksHandler(w http.ResponseWriter, r *http.Request) {
 
 // Обработчик для /tasks/{id}
 func taskByIDHandler(w http.ResponseWriter, r *http.Request) {
-	// для извлечения id из URL
 	parts := strings.Split(r.URL.Path, "/")
 	if len(parts) != 3 {
 		http.Error(w, "Неверный URL", http.StatusBadRequest)
@@ -129,8 +197,13 @@ func createTask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// генерация нового ююид
+	if task.Title == "" {
+		http.Error(w, "Title не может быть пустым", http.StatusBadRequest)
+		return
+	}
+
 	task.ID = uuid.New().String()
+	task.Done = false // Всегда создаем как невыполненную
 
 	_, err := db.Exec("INSERT INTO tasks (id, title, done) VALUES ($1, $2, $3)",
 		task.ID, task.Title, task.Done)
@@ -168,13 +241,23 @@ func updateTask(w http.ResponseWriter, r *http.Request, id string) {
 		return
 	}
 
-	// Используем переданный в URL id
+	if task.Title == "" {
+		http.Error(w, "Title не может быть пустым", http.StatusBadRequest)
+		return
+	}
+
 	task.ID = id
 
-	_, err := db.Exec("UPDATE tasks SET title = $1, done = $2 WHERE id = $3",
+	result, err := db.Exec("UPDATE tasks SET title = $1, done = $2 WHERE id = $3",
 		task.Title, task.Done, task.ID)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Задача не найдена", http.StatusNotFound)
 		return
 	}
 
@@ -183,9 +266,15 @@ func updateTask(w http.ResponseWriter, r *http.Request, id string) {
 }
 
 func deleteTask(w http.ResponseWriter, r *http.Request, id string) {
-	_, err := db.Exec("DELETE FROM tasks WHERE id = $1", id)
+	result, err := db.Exec("DELETE FROM tasks WHERE id = $1", id)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	rowsAffected, _ := result.RowsAffected()
+	if rowsAffected == 0 {
+		http.Error(w, "Задача не найдена", http.StatusNotFound)
 		return
 	}
 
